@@ -171,6 +171,7 @@ html, body, .stApp, .stApp p, .stApp div, .stApp span, .stApp label,
     background: #B4F056; color: #1E2A08; font-weight: 600;
     padding: 0.05rem 0.5rem; border-radius: 999px; margin-right: 0.15rem;
 }
+.verdict-winner.gray { background: #ECECE7; color: #55554F; }
 
 /* 차트 카드 래퍼 */
 .chart-note { font-size: 0.8rem; color: #9B9B94; margin: -0.3rem 0 0.4rem; }
@@ -284,15 +285,25 @@ def compute_metrics(symbol: str, df: pd.DataFrame) -> dict:
     }
 
 
-def relative_scores(values: list[float], invert: bool = False) -> list[float]:
-    """비교 종목끼리 30~95점 상대 스코어. 값이 같으면 60점."""
-    arr = np.array(values, dtype=float)
-    if invert:
-        arr = -arr
-    lo, hi = arr.min(), arr.max()
-    if hi - lo < 1e-9:
-        return [60.0] * len(arr)
-    return list(30 + (arr - lo) / (hi - lo) * 65)
+def clip_score(x: float) -> float:
+    return float(np.clip(x, 5, 95))
+
+
+def absolute_scores(stock: dict) -> dict:
+    """종목 간 상대 비교가 아닌 절대 기준 0~100 스코어.
+    실제 지표 차이가 작으면 차트에서도 작게 보이도록 고정 스케일 사용."""
+    return {
+        # 기간 수익률: -90% → 5점, 0% → 50점, +90% → 95점
+        "수익률": clip_score(50 + stock["return"] / 2),
+        # 최근 모멘텀(기간의 1/4 구간): ±45%에서 포화
+        "최근 모멘텀": clip_score(50 + stock["momentum"]),
+        # 연환산 변동성: 0% → 95점, 65% 이상 → 5점 근처
+        "안정성": clip_score(100 - stock["volatility"] * 1.4),
+        # 최대 낙폭: 0% → 95점, -60% → 5점 근처
+        "낙폭 방어": clip_score(100 + stock["mdd"] * 1.6),
+        # 일평균 거래대금(USD 환산, 로그 스케일): $10만 → 5점, $1000만 → 40점, $100억 → 95점
+        "거래대금": clip_score((math.log10(max(stock["trade_value"], 1.0)) - 5) * 20),
+    }
 
 
 # ──────────────────────────────────────────────
@@ -380,7 +391,7 @@ for i, s in enumerate(stocks):
 st.markdown('<div class="section-label">핵심 지표</div>', unsafe_allow_html=True)
 cards = st.columns(len(stocks))
 for col, s in zip(cards, stocks):
-    badge_cls = "badge-up" if s["return"] >= 0 else "badge-down"
+    badge_cls = "badge-up" if s["return"] > 0 else "badge-down"
     col.markdown(
         f"""
 <div class="stock-card">
@@ -448,23 +459,17 @@ st.plotly_chart(line_fig, use_container_width=True, config={"displayModeBar": Fa
 radar_col, verdict_col = st.columns([1, 1])
 
 AXES = ["수익률", "최근 모멘텀", "안정성", "낙폭 방어", "거래대금"]
-score_table = {
-    "수익률": relative_scores([s["return"] for s in stocks]),
-    "최근 모멘텀": relative_scores([s["momentum"] for s in stocks]),
-    "안정성": relative_scores([s["volatility"] for s in stocks], invert=True),
-    "낙폭 방어": relative_scores([s["mdd"] for s in stocks]),
-    "거래대금": relative_scores([s["trade_value"] for s in stocks]),
-}
+stock_scores = [absolute_scores(s) for s in stocks]
 
 with radar_col:
     st.markdown('<div class="section-label">강점 비교</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="chart-note">비교 종목끼리의 상대 점수(0~100)예요. 축이 넓을수록 그 항목이 상대적으로 강했어요.</div>',
+        '<div class="chart-note">각 항목을 절대 기준 0~100 점수로 환산했어요. 실제 차이가 작으면 축 길이 차이도 작게 보여요.</div>',
         unsafe_allow_html=True,
     )
     radar_fig = go.Figure()
     for i, s in enumerate(stocks):
-        r = [score_table[a][i] for a in AXES]
+        r = [stock_scores[i][a] for a in AXES]
         c = s["color"].lstrip("#")
         rgb = tuple(int(c[j : j + 2], 16) for j in (0, 2, 4))
         radar_fig.add_trace(
@@ -502,9 +507,9 @@ with verdict_col:
         mom_winner = max(stocks, key=lambda s: s["momentum"])
         liq_winner = max(stocks, key=lambda s: s["trade_value"])
 
-        headline = f"{period_label} 수익률은 {ret_winner['name']} 승, 안정성은 {stab_winner['name']} 승!"
+        headline = f"{period_label} 수익률은 {ret_winner['name']} 우세, 안정성은 {stab_winner['name']} 우세!"
         if ret_winner["symbol"] == stab_winner["symbol"]:
-            headline = f"{period_label} 동안은 수익률과 안정성 모두 {ret_winner['name']} 승이었어요."
+            headline = f"{period_label} 동안은 수익률과 안정성 모두 {ret_winner['name']} 우세였어요."
 
         def detail(fmt):
             return " · ".join(f"{s['name']} {fmt(s)}" for s in stocks)
@@ -514,17 +519,18 @@ with verdict_col:
         others_mdd = detail(lambda s: f"{s['mdd']:.1f}%")
         others_mom = detail(lambda s: fmt_pct(s["momentum"]))
 
+        # 라임그린 칩은 실제 수익이 난 항목에만 사용 — 손실 중 우세는 중립 회색
         rows = [
-            ("기간 수익률", ret_winner["name"], others_ret),
-            ("안정성(변동성↓)", stab_winner["name"], others_vol),
-            ("낙폭 방어", mdd_winner["name"], others_mdd),
-            ("최근 모멘텀", mom_winner["name"], others_mom),
-            ("거래대금", liq_winner["name"], "거래가 더 활발했어요"),
+            ("기간 수익률", ret_winner["name"], others_ret, ret_winner["return"] > 0),
+            ("안정성(변동성↓)", stab_winner["name"], others_vol, False),
+            ("낙폭 방어", mdd_winner["name"], others_mdd, False),
+            ("최근 모멘텀", mom_winner["name"], others_mom, mom_winner["momentum"] > 0),
+            ("거래대금", liq_winner["name"], "거래가 더 활발했어요", False),
         ]
         rows_html = "".join(
             f'<div class="verdict-row"><span class="verdict-metric">{metric}</span>'
-            f'<span class="verdict-result"><span class="verdict-winner">{winner} 승</span> {detail}</span></div>'
-            for metric, winner, detail in rows
+            f'<span class="verdict-result"><span class="verdict-winner{"" if is_gain else " gray"}">{winner} 우세</span> {detail}</span></div>'
+            for metric, winner, detail, is_gain in rows
         )
         st.markdown(
             f'<div class="verdict-card"><div class="verdict-headline">{headline}</div>{rows_html}</div>',
