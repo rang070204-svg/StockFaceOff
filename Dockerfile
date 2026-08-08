@@ -12,4 +12,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8501
 
 # Render는 PORT 환경변수를 주입함. 없으면 8501 사용.
-CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0"]
+CMD ["sh", "-c", "streamlit run app.py --server.fileWatcherType=none --server.headless=true --server.address=0.0.0.0 --server.port=${PORT:-8501}"]
